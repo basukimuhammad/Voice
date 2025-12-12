@@ -1,76 +1,589 @@
 <!DOCTYPE html>
-<html>
+<html lang="id">
 <head>
-  <title>Web Voice Chat</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Voice Chat — WebRTC (Render ready)</title>
+<style>
+  :root{--bg:#0f1724;--card:#0b1220;--muted:#9aa6b2;--accent:#7dd3fc;}
+  body{font-family:Inter,system-ui,Arial;background:linear-gradient(180deg,#071126,#0b1220);color:#e6eef6;margin:0;padding:16px}
+  .app{max-width:980px;margin:0 auto}
+  header{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+  input,button,select{padding:8px;border-radius:8px;border:0;outline:none}
+  .card{background:rgba(255,255,255,0.03);padding:12px;border-radius:12px;margin-bottom:12px}
+  .top{display:flex;gap:12px;flex-wrap:wrap}
+  .users{min-width:220px}
+  #usersList{list-style:none;padding:0;margin:0}
+  li.user{display:flex;align-items:center;gap:8px;padding:6px;border-radius:8px}
+  .dot{width:10px;height:10px;border-radius:50%}
+  .muted{opacity:.6}
+  .controls{display:flex;gap:8px;flex-wrap:wrap}
+  .meter{width:60px;height:10px;background:rgba(255,255,255,0.06);border-radius:6px;overflow:hidden}
+  .meter > i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),#38bdf8)}
+  .chat{height:250px;overflow:auto;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px}
+  .chat .msg{margin:6px 0}
+  .file-btn{display:inline-block;padding:8px 12px;border-radius:8px;background:rgba(255,255,255,0.04);cursor:pointer}
+  .small{font-size:13px;color:var(--muted)}
+  footer{font-size:13px;color:var(--muted);text-align:center;margin-top:12px}
+</style>
 </head>
 <body>
-  <h2>Voice Chat</h2>
-  <input id="roomInput" placeholder="Room name">
-  <button onclick="joinRoom()">Join</button>
+<div class="app">
+  <header>
+    <h2>Voice Chat Web (P2P) — Ready for Render</h2>
+  </header>
 
-  <script>
-    let ws;
-    let pc;
+  <div class="card top">
+    <div style="flex:1">
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="roomInput" placeholder="Nama room (mis: room123)"/>
+        <input id="nameInput" placeholder="Nama kamu (mis: Budi)" />
+        <button id="joinBtn">Join Room</button>
+        <button id="leaveBtn" disabled>Leave</button>
+      </div>
+      <div class="small" style="margin-top:8px">Koneksi: <span id="status">idle</span></div>
+    </div>
 
-    function joinRoom() {
-      const room = document.getElementById("roomInput").value;
-      if (!room) return alert("Isi room dulu!");
+    <div class="users card" style="min-width:260px">
+      <strong>Online pengguna</strong>
+      <ul id="usersList"></ul>
+    </div>
+  </div>
 
-      ws = new WebSocket(location.origin.replace("http", "ws"));
+  <div class="card controls">
+    <button id="muteBtn" disabled>Mute</button>
+    <button id="shareBtn" disabled>Share Screen</button>
+    <label class="file-btn" id="fileLabel">
+      Pilih file
+      <input id="fileInput" type="file" style="display:none" />
+    </label>
+    <button id="sendFileBtn" disabled>Send File to Selected</button>
+    <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+      <div class="small">Your level</div>
+      <div class="meter"><i id="localLevel"></i></div>
+    </div>
+  </div>
 
-      ws.onopen = () => {
-        ws.send(JSON.stringify({ type: "join", room }));
+  <div class="card" style="display:flex;gap:12px;align-items:flex-start">
+    <div style="flex:1;min-width:320px">
+      <strong>Remote audio</strong>
+      <div id="remoteContainer" style="margin-top:8px"></div>
+    </div>
+
+    <div style="width:360px">
+      <strong>Chat & Files</strong>
+      <div class="chat" id="chatBox"></div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input id="chatInput" placeholder="Ketik pesan..." style="flex:1" />
+        <button id="sendChatBtn" disabled>Kirim</button>
+      </div>
+    </div>
+  </div>
+
+  <footer>Simple mesh P2P (2-5 users recommended). Untuk lebih banyak user, gunakan SFU (mediasoup/livekit).</footer>
+</div>
+
+<script>
+(async function(){
+  // Config
+  const wsProtocol = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+  const wsUrl = wsProtocol + '//' + location.host;
+  let ws;
+  let localStream = null;
+  const peers = {}; // peerId -> {pc, dc, audioEl, analyser, levelEl}
+  let clientId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+  let roomName = '';
+  let name = '';
+  const servers = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+  // DOM
+  const joinBtn = document.getElementById('joinBtn');
+  const leaveBtn = document.getElementById('leaveBtn');
+  const roomInput = document.getElementById('roomInput');
+  const nameInput = document.getElementById('nameInput');
+  const statusEl = document.getElementById('status');
+  const usersList = document.getElementById('usersList');
+  const muteBtn = document.getElementById('muteBtn');
+  const shareBtn = document.getElementById('shareBtn');
+  const remoteContainer = document.getElementById('remoteContainer');
+  const localLevel = document.getElementById('localLevel');
+  const chatBox = document.getElementById('chatBox');
+  const chatInput = document.getElementById('chatInput');
+  const sendChatBtn = document.getElementById('sendChatBtn');
+  const fileInput = document.getElementById('fileInput');
+  const sendFileBtn = document.getElementById('sendFileBtn');
+
+  // helpers
+  function logChat(txt, who='system') {
+    const d = document.createElement('div'); d.className='msg';
+    d.innerHTML = `<strong class="small">${who}:</strong> ${txt}`;
+    chatBox.appendChild(d);
+    chatBox.scrollTop = chatBox.scrollHeight;
+  }
+
+  function updateUsersList() {
+    usersList.innerHTML = '';
+    Object.keys(peers).forEach(id => {
+      const li = document.createElement('li'); li.className='user';
+      const color = peers[id].muted ? '#f97316' : '#34d399';
+      li.innerHTML = `<div style="width:36px;height:36px;border-radius:10px;background:linear-gradient(180deg,#0b1220,#0f1724);display:flex;align-items:center;justify-content:center">${peers[id].name?peers[id].name.slice(0,2):id.slice(0,2)}</div>
+                      <div style="flex:1">
+                        <div style="font-weight:600">${peers[id].name || id}</div>
+                        <div class="small">${id}</div>
+                      </div>
+                      <div style="display:flex;flex-direction:column;align-items:flex-end">
+                        <div class="dot" style="background:${color}"></div>
+                        <div class="meter" style="width:60px;margin-top:6px"><i style="width:${(peers[id].level||0)*100}%"></i></div>
+                      </div>`;
+      li.onclick = () => {
+        // select peer for file send
+        Object.keys(peers).forEach(k => peers[k].selected = false);
+        peers[id].selected = true;
+        Array.from(usersList.children).forEach(el => el.style.background='');
+        li.style.background='rgba(255,255,255,0.02)';
       };
+      usersList.appendChild(li);
+    });
+  }
 
-      ws.onmessage = async (event) => {
-        const data = JSON.parse(event.data);
-
-        if (data.type === "user-join") {
-          startCall(room);
+  // open WS + handlers
+  function connectWS() {
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => { status('connected'); };
+    ws.onclose = () => { status('disconnected'); cleanupAllPeers(); };
+    ws.onerror = (e) => console.error(e);
+    ws.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'existing-peers') {
+        // peers array -> create offer to each
+        for (const id of msg.peers) {
+          await createPeerConnection(id, true);
         }
-
-        if (data.type === "signal") {
-          if (data.sdp) {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-            if (data.sdp.type === "offer") {
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-              ws.send(JSON.stringify({ type: "signal", sdp: answer, room }));
-            }
-          }
-
-          if (data.ice) {
-            pc.addIceCandidate(new RTCIceCandidate(data.ice));
+      } else if (msg.type === 'new-peer') {
+        // other peer joined -> create offer to them
+        await createPeerConnection(msg.id, true);
+      } else if (msg.type === 'signal') {
+        const from = msg.from;
+        const payload = msg.payload;
+        if (!peers[from]) {
+          // prepare to accept incoming (create pc)
+          await createPeerConnection(from, false);
+        }
+        const pc = peers[from].pc;
+        if (payload.sdp) {
+          await pc.setRemoteDescription(payload.sdp);
+          if (payload.sdp.type === 'offer') {
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            ws.send(JSON.stringify({ type:'signal', room:roomName, clientId, target:from, payload:{ sdp: pc.localDescription } }));
           }
         }
+        if (payload.ice) {
+          try { await pc.addIceCandidate(payload.ice); } catch(e){ console.warn('addIce failed',e); }
+        }
+      } else if (msg.type === 'peer-left') {
+        const id = msg.id;
+        if (peers[id]) removePeer(id);
+        logChat(`${id} left`, 'system');
+      }
+    };
+  }
+
+  function status(txt){ statusEl.textContent = txt; }
+
+  // create PeerConnection + DataChannel
+  async function createPeerConnection(peerId, isOffer) {
+    if (peers[peerId]) return;
+    const pc = new RTCPeerConnection(servers);
+    peers[peerId] = { pc, name: null, muted:false, level:0, selected:false };
+
+    // attach local tracks
+    if (localStream) {
+      for (const track of localStream.getTracks()) pc.addTrack(track, localStream);
+    }
+
+    // data channel (for chat & file)
+    let dataCh;
+    if (isOffer) {
+      dataCh = pc.createDataChannel('chat');
+      setupDataChannel(peerId, dataCh);
+    } else {
+      pc.ondatachannel = (e) => {
+        dataCh = e.channel;
+        setupDataChannel(peerId, dataCh);
       };
     }
 
-    async function startCall(room) {
-      pc = new RTCPeerConnection();
-
-      navigator.mediaDevices.getUserMedia({ audio: true })
-        .then(stream => {
-          stream.getTracks().forEach(track => pc.addTrack(track, stream));
-        });
-
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          ws.send(JSON.stringify({ type: "signal", ice: e.candidate, room }));
-        }
-      };
-
-      pc.ontrack = (e) => {
-        const audio = new Audio();
+    // remote track handling
+    pc.ontrack = (e) => {
+      let d = peers[peerId].audioEl;
+      if (!d) {
+        d = document.createElement('div');
+        d.style.marginBottom = '8px';
+        const audio = document.createElement('audio'); audio.autoplay = true; audio.controls = true;
         audio.srcObject = e.streams[0];
-        audio.play();
-      };
+        d.appendChild(audio);
 
+        // level meter for remote
+        const meterWrap = document.createElement('div'); meterWrap.className='meter'; meterWrap.style.width='120px;margin-top:6px';
+        const i = document.createElement('i'); meterWrap.appendChild(i);
+        d.appendChild(meterWrap);
+
+        remoteContainer.appendChild(d);
+        peers[peerId].audioEl = d;
+        peers[peerId].levelEl = i;
+
+        // analyze remote stream
+        try {
+          const ctx = new AudioContext();
+          const src = ctx.createMediaStreamSource(e.streams[0]);
+          const analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+          src.connect(analyser);
+          peers[peerId].analyser = analyser;
+          measureRemoteLevel(peerId);
+        } catch(err){ console.warn('analyze failed', err); }
+      }
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        ws.send(JSON.stringify({ type:'signal', room:roomName, clientId, target:peerId, payload:{ ice: e.candidate } }));
+      }
+    };
+
+    // track connection state
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        logChat(`Connected to ${peerId}`, 'system');
+      }
+    };
+
+    // create offer if isOffer
+    if (isOffer) {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-
-      ws.send(JSON.stringify({ type: "signal", sdp: offer, room }));
+      ws.send(JSON.stringify({ type:'signal', room:roomName, clientId, target:peerId, payload:{ sdp: pc.localDescription } }));
     }
-  </script>
+  }
+
+  // Data channel helpers
+  function setupDataChannel(peerId, dc) {
+    peers[peerId].dc = dc;
+    dc.onopen = () => {
+      logChat(`Data channel open with ${peerId}`, 'system');
+    };
+    dc.onmessage = (ev) => {
+      // messages can be string JSON or binary
+      if (typeof ev.data === 'string') {
+        try {
+          const json = JSON.parse(ev.data);
+          if (json.type === 'chat') {
+            logChat(json.text, peers[peerId].name || peerId);
+          } else if (json.type === 'meta-file') {
+            // prepare to receive
+            peers[peerId].incomingFile = { name: json.name, size: json.size, mime: json.mime, received: 0, chunks: [] };
+            logChat(`Incoming file "${json.name}" (${Math.round(json.size/1024)} KB) from ${peers[peerId].name || peerId}`, 'system');
+          }
+        } catch(e){
+          console.log('json parse fail', e);
+        }
+      } else {
+        // binary chunk (ArrayBuffer)
+        const arr = new Uint8Array(ev.data);
+        const f = peers[peerId].incomingFile;
+        if (f) {
+          f.chunks.push(arr);
+          f.received += arr.byteLength;
+          if (f.received >= f.size) {
+            // assemble
+            const blob = new Blob(f.chunks, { type: f.mime || 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = f.name;
+            a.textContent = `Download ${f.name}`;
+            const div = document.createElement('div');
+            div.appendChild(a);
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+            logChat(`File "${f.name}" received from ${peers[peerId].name || peerId}`, 'system');
+            peers[peerId].incomingFile = null;
+          }
+        }
+      }
+    };
+  }
+
+  // measure local level
+  let localAnalyser;
+  function startLocalLevelMeter() {
+    try {
+      const ctx = new AudioContext();
+      const src = ctx.createMediaStreamSource(localStream);
+      localAnalyser = ctx.createAnalyser(); localAnalyser.fftSize = 2048;
+      src.connect(localAnalyser);
+      measureLocalLevel();
+    } catch(e){ console.warn('local analyser fail', e); }
+  }
+  function measureLocalLevel() {
+    if (!localAnalyser) return;
+    const arr = new Uint8Array(localAnalyser.frequencyBinCount);
+    localAnalyser.getByteFrequencyData(arr);
+    const sum = arr.reduce((a,b)=>a+b,0);
+    const avg = sum / arr.length / 255;
+    localLevel.style.width = (avg*100) + '%';
+    requestAnimationFrame(measureLocalLevel);
+  }
+  function measureRemoteLevel(peerId) {
+    const p = peers[peerId];
+    if (!p || !p.analyser || !p.levelEl) return;
+    const arr = new Uint8Array(p.analyser.frequencyBinCount);
+    p.analyser.getByteFrequencyData(arr);
+    const sum = arr.reduce((a,b)=>a+b,0);
+    const avg = sum / arr.length / 255;
+    p.levelEl.style.width = (avg*100) + '%';
+    p.level = avg;
+    updateUsersList();
+    requestAnimationFrame(()=>measureRemoteLevel(peerId));
+  }
+
+  function removePeer(id) {
+    if (!peers[id]) return;
+    try {
+      peers[id].pc.close();
+    } catch(e){}
+    if (peers[id].audioEl) peers[id].audioEl.remove();
+    delete peers[id];
+    updateUsersList();
+  }
+
+  function cleanupAllPeers() {
+    Object.keys(peers).forEach(id => removePeer(id));
+  }
+
+  // UI actions
+  joinBtn.onclick = async () => {
+    if (!roomInput.value.trim()) return alert('Isi nama room dulu.');
+    roomName = roomInput.value.trim();
+    name = nameInput.value.trim() || 'Anon';
+    clientId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+    connectWS();
+    // get mic
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      startLocalLevelMeter();
+      status('joined (awaiting peers)');
+      // show mute
+      muteBtn.disabled = false;
+      shareBtn.disabled = false;
+      sendChatBtn.disabled = false;
+      sendFileBtn.disabled = false;
+      leaveBtn.disabled = false;
+      joinBtn.disabled = true;
+    } catch(e){ alert('Gagal akses microphone: ' + e.message); return; }
+
+    // send join after ws open
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ type:'join', room: roomName, clientId }));
+      // optionally send our name to peers via broadcast through signaling (not stored server-side)
+      // we will include name later via datachannel once created
+    });
+
+    // When new peer pc created, after dc open we send our name
+    // update status
+    status('joined, waiting for peers to connect');
+  };
+
+  leaveBtn.onclick = () => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'leave', room:roomName, clientId }));
+    cleanupAllPeers();
+    if (localStream) {
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+    }
+    if (ws) ws.close();
+    joinBtn.disabled = false;
+    muteBtn.disabled = true;
+    shareBtn.disabled = true;
+    sendChatBtn.disabled = true;
+    sendFileBtn.disabled = true;
+    leaveBtn.disabled = true;
+    status('left');
+  };
+
+  muteBtn.onclick = () => {
+    if (!localStream) return;
+    const enabled = localStream.getAudioTracks()[0].enabled;
+    localStream.getAudioTracks()[0].enabled = !enabled;
+    muteBtn.textContent = enabled ? 'Unmute' : 'Mute';
+  };
+
+  shareBtn.onclick = async () => {
+    if (!localStream) return;
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      // add tracks to each pc (replace track or add)
+      for (const id of Object.keys(peers)) {
+        const pc = peers[id].pc;
+        // add or replace video sender
+        const senders = pc.getSenders();
+        const videoSender = senders.find(s => s.track && s.track.kind === 'video');
+        if (videoSender) {
+          const vtrack = displayStream.getVideoTracks()[0];
+          await videoSender.replaceTrack(vtrack);
+        } else {
+          displayStream.getTracks().forEach(track => pc.addTrack(track, displayStream));
+        }
+      }
+      logChat('Sharing screen...');
+      // stop share when ended
+      displayStream.getTracks().forEach(t => t.onended = () => logChat('Screen sharing stopped', 'system'));
+    } catch(e){ alert('Gagal share screen: ' + e.message); }
+  };
+
+  // Chat send
+  sendChatBtn.onclick = () => {
+    const txt = chatInput.value.trim();
+    if (!txt) return;
+    // send to all peers
+    Object.values(peers).forEach(p => {
+      if (p.dc && p.dc.readyState === 'open') {
+        p.dc.send(JSON.stringify({ type:'chat', text: `${name}: ${txt}` }));
+      }
+    });
+    logChat(txt, 'you');
+    chatInput.value = '';
+  };
+
+  // File send (chunked)
+  let selectedFile = null;
+  fileInput.onchange = (e) => {
+    selectedFile = e.target.files[0];
+  };
+
+  sendFileBtn.onclick = async () => {
+    if (!selectedFile) return alert('Pilih file dulu');
+    // find selected peer(s)
+    const targets = Object.keys(peers).filter(id => peers[id].selected);
+    if (targets.length === 0) {
+      // if none selected, broadcast to all
+      targets.push(...Object.keys(peers));
+    }
+    const CHUNK = 16 * 1024; // 16KB
+    for (const tid of targets) {
+      const dc = peers[tid].dc;
+      if (!dc || dc.readyState !== 'open') { alert('DataChannel not ready for ' + tid); continue; }
+      // send metadata first
+      dc.send(JSON.stringify({ type:'meta-file', name: selectedFile.name, size: selectedFile.size, mime: selectedFile.type }));
+      const stream = selectedFile.stream();
+      const reader = stream.getReader();
+      let done, value;
+      while (true) {
+        ({ done, value } = await reader.read());
+        if (done) break;
+        // send chunk
+        dc.send(value);
+        // optional small delay to avoid congestion
+        await new Promise(r => setTimeout(r, 5));
+      }
+      logChat(`Sent file ${selectedFile.name} to ${peers[tid].name || tid}`, 'you');
+    }
+    // clear
+    fileInput.value = '';
+    selectedFile = null;
+  };
+
+  // When a new peer set up datachannel opened, send our display name
+  // We'll patch into setupDataChannel to send name upon open (added earlier)
+  // To ensure name is sent, modify setupDataChannel to send when open:
+  const oldSetup = setupDataChannel;
+  function setupDataChannel(peerId, dc) {
+    oldSetup(peerId, dc);
+    dc.onopen = () => {
+      // send our name to peer
+      dc.send(JSON.stringify({ type:'chat', text: `__meta_name:${name}` }));
+    };
+  }
+  // override
+  window.setupDataChannel = setupDataChannel;
+
+  // Intercept chat messages special meta: set peer name
+  const originalLog = logChat;
+  function interceptDataMessage(peerId, txt) {
+    if (txt.startsWith('__meta_name:')) {
+      const nm = txt.split(':')[1];
+      peers[peerId].name = nm;
+      updateUsersList();
+      logChat(`${nm} joined`, 'system');
+    } else {
+      originalLog(txt, peers[peerId].name || peerId);
+    }
+  }
+
+  // BUT we need to ensure messages hitting from peers call interceptDataMessage.
+  // To implement without rewriting earlier code, let's tweak setupDataChannel a bit more:
+  // Re-define setupDataChannel fully:
+  function setupDataChannel(peerId, dc) {
+    peers[peerId].dc = dc;
+    dc.onopen = () => {
+      // send our name meta
+      dc.send(JSON.stringify({ type:'chat', text: `__meta_name:${name}` }));
+      logChat(`Data channel open with ${peerId}`, 'system');
+    };
+    dc.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          const json = JSON.parse(ev.data);
+          if (json.type === 'chat') {
+            const txt = json.text;
+            if (txt.startsWith('__meta_name:')) {
+              const nm = txt.split(':')[1];
+              peers[peerId].name = nm;
+              updateUsersList();
+              logChat(`${nm} joined`, 'system');
+            } else {
+              logChat(txt, peers[peerId].name || peerId);
+            }
+          } else if (json.type === 'meta-file') {
+            peers[peerId].incomingFile = { name: json.name, size: json.size, mime: json.mime, received: 0, chunks: [] };
+            logChat(`Incoming file "${json.name}" (${Math.round(json.size/1024)} KB) from ${peers[peerId].name || peerId}`, 'system');
+          }
+        } catch(e){ console.log('json parse fail', e); }
+      } else {
+        // binary chunk
+        const arr = new Uint8Array(ev.data);
+        const f = peers[peerId].incomingFile;
+        if (f) {
+          f.chunks.push(arr);
+          f.received += arr.byteLength;
+          if (f.received >= f.size) {
+            const blob = new Blob(f.chunks, { type: f.mime || 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = f.name;
+            a.textContent = `Download ${f.name}`;
+            const div = document.createElement('div');
+            div.appendChild(a);
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+            logChat(`File "${f.name}" received from ${peers[peerId].name || peerId}`, 'system');
+            peers[peerId].incomingFile = null;
+          }
+        }
+      }
+    };
+  }
+
+  // override global to ensure usage in createPeerConnection
+  window.setupDataChannel = setupDataChannel;
+
+  // small safety: catch unload
+  window.addEventListener('beforeunload', () => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type:'leave', room:roomName, clientId }));
+  });
+
+})();
+</script>
 </body>
 </html>
