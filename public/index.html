@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Web Voice Chat</title>
+</head>
+<body>
+  <h2>Voice Chat</h2>
+  <input id="roomInput" placeholder="Room name">
+  <button onclick="joinRoom()">Join</button>
+
+  <script>
+    let ws;
+    let pc;
+
+    function joinRoom() {
+      const room = document.getElementById("roomInput").value;
+      if (!room) return alert("Isi room dulu!");
+
+      ws = new WebSocket(location.origin.replace("http", "ws"));
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: "join", room }));
+      };
+
+      ws.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "user-join") {
+          startCall(room);
+        }
+
+        if (data.type === "signal") {
+          if (data.sdp) {
+            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            if (data.sdp.type === "offer") {
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify({ type: "signal", sdp: answer, room }));
+            }
+          }
+
+          if (data.ice) {
+            pc.addIceCandidate(new RTCIceCandidate(data.ice));
+          }
+        }
+      };
+    }
+
+    async function startCall(room) {
+      pc = new RTCPeerConnection();
+
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(stream => {
+          stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        });
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          ws.send(JSON.stringify({ type: "signal", ice: e.candidate, room }));
+        }
+      };
+
+      pc.ontrack = (e) => {
+        const audio = new Audio();
+        audio.srcObject = e.streams[0];
+        audio.play();
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      ws.send(JSON.stringify({ type: "signal", sdp: offer, room }));
+    }
+  </script>
+</body>
+</html>
